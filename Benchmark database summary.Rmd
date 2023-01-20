@@ -1,0 +1,764 @@
+---
+title: "Benchmark Database summary"
+author: "Country Diagnostics & Strategy"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(hrbrthemes)
+library(readxl)
+library(shiny)
+library(ggrepel)
+library(countrycode)
+library(viridis)
+library(formattable)
+library(kableExtra)
+library(ggpmisc)
+knitr::opts_chunk$set(echo = F, warning=F, message=F)
+options(scipen=999)
+
+# Load updated files
+benchmark <- fread("./data/0_benchmark_db_v2.csv")
+bench.tidy <- fread("./data/0_benchmark_tidy_v2.csv")
+meta.data <- fread("./data/0_benchmark_meta_v2.csv")
+indic.list <- read_excel("./data/Indicator list.xlsx", sheet = "Information sheet")
+unit.dat <- fread("./data/0_benchmark_units.csv")
+
+non.auto <- unique(meta.data$Non.automated)
+time <- meta.data[1,2]
+
+bench.code <- unique(benchmark$indicator_code)
+
+bench.indicators <- data.frame()
+
+for (var in bench.code){
+  
+  dat <- benchmark %>%
+    filter(indicator_code==var) %>%
+    mutate(year=as.numeric(year)) %>%
+    mutate(min.year=min(year)) %>%
+    mutate(max.year=max(year))%>%
+    mutate(`Observation period` = paste0(min.year, "-", max.year)) %>%
+    mutate(`Number of obs`=length(unique(iso3c))) %>%
+    mutate(`Number of years` = length(unique(year))) %>%
+    mutate(`Difference max-min` = (max.year-min.year)+1) %>%
+    slice(1) %>%
+    select(indicator_code, max.year, `Observation period`,`Number of years`, `Number of obs`, `Difference max-min`) %>%
+    rename("Latest observation" = "max.year")
+  
+  bench.indicators<-rbind(bench.indicators, dat)
+}
+
+# Checks the ratio of each countries # of obs/year compared with the full indicator
+complete.set <- benchmark %>%
+  merge(., bench.indicators) %>%
+  select(-V1, -source, -`Latest observation`, -`Observation period`, -`Number of obs`,  -`Difference max-min`, -VALUE) %>%
+  group_by(indicator_code, iso3c) %>%
+  mutate(val = length(unique(year))) %>%
+  mutate(`How complete?` = (val/`Number of years`)) %>%
+  group_by(indicator_code) %>%
+  summarize(`How complete?` = mean(`How complete?`)) %>%
+  ungroup()
+
+bench.indicators <- bench.indicators %>% merge(., complete.set, by="indicator_code")
+
+bench.indicators<-merge(indic.list, bench.indicators, by.x="Indicator code", by.y = "indicator_code", all=T)
+
+test <- bench.tidy %>%
+  filter(indicator_code=="SG.VAW.1549.ZS")
+
+missings <- bench.indicators %>% filter(is.na(`Observation period`))
+bench.indicators <- bench.indicators %>% filter(!is.na(`Observation period`))
+
+# Countries not used in analysis
+cdrops <- c("North Korea", "Macao", "Singapore", "Hong Kong", "San Marino", 
+            "Andorra", "Gibraltar", "Palestinian Territories", "Sint Maarten", "New Caledonia", 
+            "Northern Mariana Islands", "Isle of Man", "Luxembourg", "Ireland")
+cdrops <- countrycode(cdrops, origin = "country.name", destination = "country.name")
+
+bench.tidy <- bench.tidy %>% filter(!country %in% cdrops)
+benchmark <- benchmark %>% filter(!iso3c %in% countrycode(cdrops, origin = "country.name", destination = "iso3c"))
+
+```
+
+---
+
+### Database overview
+
+**Summary:**
+<ul> 
+  <li> The database took `r round(time, digits=2)` minutes to update at last run through. </li>
+  <li> Countries removed pre-analysis: `r cdrops`. </li>
+  <li> Any year equal to current year or greater (often modeled ILO estimates) is dropped. </li>
+  <li> Outlier removal is based on values that fall below the 10th percentile or above the 90th percentile. </li>
+</ul>
+
+<!-- **To do:** -->
+<!-- <ul>  -->
+<!--   <li> Create list of assumptions for database & validate each </li> -->
+<!--   <li> Verify name, code matches </li> -->
+<!--   <li> Validate EACH indicator to see if it makes sense compared to description </li> -->
+<!-- </ul> -->
+
+---
+
+```{r income wheels}
+
+cat.group <- unique(bench.tidy$cat)
+
+income.wheel.plotter <- function(i) {
+  
+circle.dat <- bench.tidy %>% 
+  filter(cat == cat.group[i]) %>%
+  select(-V1) %>%
+  select(subcat, `income group`, indicator, iso3c, year, VALUE, source) %>%
+  group_by(indicator, iso3c) %>%
+  filter(year==max(year)) %>%
+  group_by(`income group`, indicator) %>%
+  mutate(val = length(iso3c)) %>%
+  slice(1) %>%
+  arrange(subcat, indicator, `income group`, iso3c) %>%
+  select(-iso3c, -source, -VALUE, -year) %>%
+  pivot_wider(names_from=`income group`, values_from=val)
+
+circle.dat[is.na(circle.dat)] <- 0  
+circle.dat <- circle.dat %>% 
+  gather(key = "observation", value="value", -c(1,2)) %>%
+  rename("group" = "subcat", "individual" = "indicator")
+
+data <- circle.dat
+
+empty_bar <- 2
+nObsType <- nlevels(as.factor(data$observation))
+to_add <- data.frame( matrix(NA, empty_bar*nlevels(data$group)*nObsType, ncol(data)) )
+colnames(to_add) <- colnames(data)
+to_add$group <- rep(levels(data$group), each=empty_bar*nObsType )
+to_add$individual <- as.character(to_add$individual)
+to_add$observation <- as.character(to_add$observation)
+to_add$value <- as.numeric(to_add$value)
+data <- rbind(data, to_add)
+data <- data %>% arrange(group, individual)
+data$id <- rep( seq(1, nrow(data)/nObsType) , each=nObsType)
+
+# Get the name and the y position of each label
+label_data <- data %>% group_by(id, individual) %>% summarize(tot=sum(value))
+number_of_bar <- nrow(label_data)
+angle <- 90 - 360 * (as.numeric(label_data$id)-0.5) /number_of_bar
+label_data$hjust <- ifelse( angle < -90, 1, 0)
+label_data$angle <- ifelse(angle < -90, angle+180, angle)
+
+# prepare a data frame for base lines
+base_data <- data %>% 
+  group_by(group) %>% 
+  summarize(start=min(id), end=max(id) - empty_bar) %>% 
+  rowwise() %>% 
+  mutate(title=mean(c(start, end)))
+
+# prepare a data frame for grid (scales)
+grid_data <- base_data
+grid_data$end <- grid_data$end[ c( nrow(grid_data), 1:nrow(grid_data)-1)] + 1
+grid_data$start <- grid_data$start - 1
+grid_data <- grid_data[-1,]
+
+label_data$individual <- gsub("\\s*\\([^\\)]+\\)", "", label_data$individual)
+
+label_data <- label_data %>% arrange(-tot)
+label_data$id <- 1:nrow(label_data)
+angle <- 90 - 360 * (as.numeric(label_data$id)-0.5) /number_of_bar
+label_data$hjust <- ifelse( angle < -90, 1, 0)
+label_data$angle <- ifelse(angle < -90, angle+180, angle)
+
+data$observation <- factor(data$observation, levels=c("High income", "Upper middle income", 
+                                                      "Lower middle income", "Low income"))
+
+max.val <- data %>%
+  group_by(individual) %>%
+  mutate(value=sum(value)) %>%
+  ungroup() %>%
+  filter(value==max(value)) %>%
+  slice(1) %>%
+  .[["value"]]
+
+p <- ggplot(data) +      
+  
+  # Add the stacked bar
+  geom_bar(aes(x=reorder(id, -value), y=value, fill=observation), stat="identity", alpha=0.9) +
+  scale_fill_viridis(discrete=TRUE) + 
+  
+  # Add text showing the value of each 100/75/50/25 lines
+  ggplot2::annotate("text", x = rep(max(data$id),5), y = c(0, 50, 100, 150, 200), label = c("0", "50", "100", "150", "200") , color="grey", size=2 , angle=0, fontface="bold", hjust=1) +
+  
+  ylim(-50,max(label_data$tot+20, na.rm=T)) +
+  theme_minimal() +
+  theme(
+    # legend.position = "none",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    legend.title = element_blank(),
+    legend.position = c(1.2, 0.15)
+    # plot.margin=unit(c(1.5,1.5,1.5,1.2),"cm")
+    # plot.margin = unit(rep(-1,4), "cm")
+  ) +
+  coord_polar() +
+  
+  geom_hline(yintercept = max.val, alpha=0.2)+
+  geom_hline(yintercept = max.val/2, alpha=0.2, linetype=2)+
+  
+  # labs(title=title.name, subtitle=sub.name) +
+
+  # Add labels on top of each bar (replace max with tot for text close to bar)
+  geom_text(data=label_data, aes(x=id, y=max.val+10, label=str_wrap(individual, 30), hjust=hjust), color="black", fontface="bold",alpha=1, size=2, angle= label_data$angle, inherit.aes = FALSE ) 
+  
+print(p)
+
+}
+
+```
+
+#### `r cat.group[1]`
+
+```{r income 1, warning=F, message=F, fig.width=10,fig.height=6}
+
+cat1 <- bench.indicators %>%
+  filter(Category == cat.group[1]) %>%
+  select( Category, `Sub-category`, `Indicator name`, `Observation period`, `Number of obs`, `How complete?`, `Latest observation`) %>%
+  arrange(Category, `Sub-category`, `Indicator name`)
+
+income.wheel.plotter(1)
+
+DT::datatable(cat1, rownames = F, options=list(searching=T, pageLength=10, info=F, lengthChange=F)) %>%
+    DT::formatPercentage("How complete?", digits=1)
+
+```
+
+#### `r cat.group[2]`
+
+```{r income 2, warning=F, message=F, fig.width=10,fig.height=6}
+
+income.wheel.plotter(2)
+
+cat2 <- bench.indicators %>%
+  filter(Category == cat.group[2]) %>%
+  select( Category, `Sub-category`, `Indicator name`, `Observation period`, `Number of obs`, `How complete?`, `Latest observation`) %>%
+  arrange(Category, `Sub-category`, `Indicator name`)
+
+DT::datatable(cat2, rownames = F, options=list(searching=T, pageLength=10, 
+                                               info=F, lengthChange=F)) %>%
+    DT::formatPercentage("How complete?", digits=1)
+
+```
+
+#### `r cat.group[3]`
+
+```{r income 3, warning=F, message=F, fig.width=10,fig.height=6}
+
+income.wheel.plotter(3)
+
+cat3 <- bench.indicators %>%
+  filter(Category == cat.group[3]) %>%
+  select( Category, `Sub-category`, `Indicator name`, `Observation period`, `Number of obs`, `How complete?`, `Latest observation`) %>%
+  arrange(Category, `Sub-category`, `Indicator name`)
+
+DT::datatable(cat3, rownames = F, options=list(searching=T, pageLength=10, 
+                                               info=F, lengthChange=F)) %>%
+    DT::formatPercentage("How complete?", digits=1)
+
+```
+
+#### `r cat.group[4]`
+
+```{r income 4, warning=F, message=F, fig.width=10,fig.height=6}
+
+income.wheel.plotter(4)
+
+cat4 <- bench.indicators %>%
+  filter(Category == cat.group[4]) %>%
+  select( Category, `Sub-category`, `Indicator name`, `Observation period`, `Number of obs`, `How complete?`, `Latest observation`) %>%
+  arrange(Category, `Sub-category`, `Indicator name`)
+
+DT::datatable(cat4, rownames = F, options=list(searching=T, pageLength=10, 
+                                               info=F, lengthChange=F)) %>%
+    DT::formatPercentage("How complete?", digits=1)
+
+```
+
+#### `r cat.group[5]`
+
+```{r income 5, warning=F, message=F, fig.width=10,fig.height=6}
+
+income.wheel.plotter(5)
+
+cat5 <- bench.indicators %>%
+  filter(Category == cat.group[5]) %>%
+  select( Category, `Sub-category`, `Indicator name`, `Observation period`, `Number of obs`, `How complete?`, `Latest observation`) %>%
+  arrange(Category, `Sub-category`, `Indicator name`)
+
+DT::datatable(cat5, rownames = F, options=list(searching=T, pageLength=10, 
+                                               info=F, lengthChange=F)) %>%
+  DT::formatPercentage(columns="How complete?", digits=1)
+
+```
+
+#### `r cat.group[6]`
+
+```{r income 6, warning=F, message=F, fig.width=10,fig.height=6}
+
+income.wheel.plotter(6)
+
+cat6 <- bench.indicators %>%
+  filter(Category == cat.group[6]) %>%
+  select( Category, `Sub-category`, `Indicator name`, `Observation period`, `Number of obs`, `How complete?`, `Latest observation`) %>%
+  arrange(Category, `Sub-category`, `Indicator name`)
+
+DT::datatable(cat6, rownames = F, options=list(searching=T, pageLength=10, 
+                                               info=F, lengthChange=F)) %>%
+    DT::formatPercentage("How complete?", digits=1)
+
+```
+
+#### Income sample sizes
+
+```{r income class, message=F, warning=F}
+
+wb_classification <- read_excel("./data/wb_classification.xlsx")
+bench.tidy <- fread("./data/0_benchmark_tidy_v2.csv") 
+
+bench.tidy <- bench.tidy %>% select(-V1) %>% filter(!country %in% cdrops)
+
+colnames(wb_classification) <- wb_classification[4,]
+wb_classification <- wb_classification[-c(1:5), -c(1,2)]
+wb_classification <- wb_classification[,c(1,2,4,5)]
+colnames(wb_classification) <- c("country", "iso3c", "region", "Income group")
+
+income.table1 <- wb_classification %>%
+  group_by(`Income group`) %>%
+  summarize(`Sample size` = length(iso3c)) %>%
+  drop_na()
+
+income.table2 <- bench.tidy %>%
+  select(indicator, `income group`, iso3c) %>%
+  rename("Income group" = "income group") %>%
+  distinct() %>%
+  group_by(indicator, `Income group`)%>%
+  mutate(val = length(indicator)) %>%
+  slice(1) %>%
+  select(-iso3c) %>%
+  group_by(`Income group`) %>%
+  summarize(`Average database sample size` = round(mean(val), digits=2),
+            `Standard deviation` = round(sd(val), digits=2)) %>%
+  merge(., income.table1) %>%
+  select(`Income group`, `Sample size`, everything()) %>%
+  rename("World Bank sample size" = "Sample size")
+
+formattable(income.table2[c(1,4,3,2),], align = c("l",rep("r", ncol(income.table2) - 1)))
+
+
+```
+
+---
+
+#### Automated indicators
+
+```{r automated}
+auto <- benchmark %>%
+  mutate(`Automated?` = ifelse(!indicator_code %in% non.auto, "Yes", "No")) %>%
+  count(`Automated?`, sort = T) %>%
+  mutate(`Percentage` = round((n/nrow(benchmark) * 100), digits=2)) %>%
+  select(-n)
+
+auto.table <- bench.tidy %>%
+  filter(indicator_code %in% non.auto) %>%
+  group_by(indicator_code) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(indicator, indicator_code, source) %>%
+  arrange(source) %>%
+  rename("Non-automated indicator names" = "indicator", "Indicator code" = "indicator_code", "Source" = "source")
+
+```
+
+`r auto %>% .[1,2] %>% .[[1]]`% of the database is automated, leaving `r auto %>% .[2,2] %>% .[[1]]`% as non-automattable. Theses non-automatable indicators come from `r unique(auto.table$Source)`. EMDAT is easy to update and could potentially be automated with some extra effort - database is highly maintained and frequently updated (2021 values already available). OECD data sources change often and many are moving to API availability, sources should be checked often in case of updates. Gallup data requires a license to access and therefore may not be automated.
+
+
+```{r automated table, echo=F}
+
+formattable(auto.table, align = c("l",rep("r", ncol(auto.table) - 1)))
+
+```
+
+---
+
+#### Sources
+
+```{r sources, include=F}
+
+sources <- bench.tidy %>%
+  select(indicator_code, source) %>%
+  distinct() %>%
+  count(source, sort = T) %>%
+  rename("Source" = "source", "Sample size" = "n") %>%
+  mutate(pct = `Sample size`/sum(`Sample size`) * 100) %>%
+  mutate(pct = round(pct, digits=2))
+
+source.table <- formattable(sources[,c(1,2)], align = c("l",rep("r", ncol(sources) - 1)))
+source.table <- as.htmlwidget(source.table, width=200)
+
+source.plot <- sources %>%
+  ggplot(aes(y=`Sample size`, x=reorder(Source, `Sample size`))) +
+  geom_col() +
+  coord_flip() +
+  labs(x="", title="Number of indicators by source", y="") +
+  theme_bw() +
+  theme(plot.title.position = "plot") 
+
+```
+
+The most sources come from `r sources %>% filter(pct == max(pct)) %>% pull(Source)` at `r sources %>% filter(pct == max(pct)) %>% pull(pct)`%. WDI is the largest and most maintained API of the sources. It also made up the largest portion of the original database, despite sources being listed as the WDI source. 
+
+
+<div class = "row">
+<div class = "col-md-6">
+```{r source plot, echo=F}
+source.plot
+```
+</div>
+
+<div class = "col-md-6">
+```{r source table, echo=F}
+kable(sources[,c(1,2)]) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, position="left")
+```
+</div>
+</div>
+
+---
+
+#### Outlier analysis
+
+```{r boxplots, warning=F, message=F, fig.align="center"}
+
+unit.dat <- unit.dat %>% select(-V1) %>% arrange(units, -VALUE)
+
+num_groups <- 8
+
+pct <- unit.dat %>% filter(units == unique(unit.dat$units)[1]) %>% group_by((row_number()-1) %/% (n()/num_groups)) 
+ind <- unit.dat %>% filter(units == unique(unit.dat$units)[2]) %>% mutate(`(row_number() - 1)%/%(n()/num_groups)` = ifelse(VALUE > 60, 1, 2))
+lvl <- unit.dat %>% filter(units == unique(unit.dat$units)[3]) %>% group_by((row_number()-1) %/% (n()/num_groups))
+
+unit.dat <- rbind(pct,ind,lvl)
+unit.dat <- unit.dat %>% ungroup() %>% select(-VALUE) %>% rename("group" = "(row_number() - 1)%/%(n()/num_groups)")
+
+bench.tidy2 <- bench.tidy %>% merge(., unit.dat)
+
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))
+}
+  
+remove_outlier <- function(x) {
+  return(x < quantile(x, 0.1) - 1.5 * IQR(x) | x > quantile(x, 0.9) + 1.5 * IQR(x))
+}
+
+bench.tidy2 <- bench.tidy2 %>%
+  group_by(indicator, year) %>% 
+  mutate(VALUE = ifelse(remove_outlier(VALUE), NA, VALUE)) %>%
+  drop_na()
+
+for(val in unique(bench.tidy2$units)) {
+  
+  benched <- bench.tidy2 %>% filter(units==val)
+
+  for(i in unique(benched$group)) {
+    
+    p <- benched %>%
+      filter(group == i) %>%
+      select(indicator, iso3c, year, VALUE) %>%
+      group_by(indicator, iso3c) %>%
+      filter(year == max(year)) %>%
+      ungroup() %>%
+      mutate(
+        indicator = gsub("\\s*\\([^\\)]+\\)", "", indicator),
+        indicator = str_wrap(indicator, 20)
+      ) %>%
+      group_by(indicator) %>%
+      mutate(outlier = if_else(is_outlier(VALUE), iso3c, NA_character_)) %>%
+      ggplot(aes(x = indicator, y = VALUE, fill = indicator)) +
+      geom_boxplot() +
+      theme_bw() +
+      scale_fill_viridis_d() +
+      guides(fill = F) +
+      theme(axis.text.x = element_text(angle = 90,)) +
+      geom_text_repel(aes(label = outlier))
+    
+    print(p)
+  }
+}
+
+```
+
+---
+
+#### Linear fit 
+
+```{r scatterplot, message=F, out.width="33%", fig.show="hold"}
+
+cur.year <- as.numeric(format(Sys.Date(), format="%Y"))
+
+bench.tidy3 <- bench.tidy2 %>%
+  ungroup() %>%
+  select(indicator_code, iso3c, year, VALUE) %>%
+  arrange(indicator_code, iso3c, year) %>%
+  group_by(indicator_code, iso3c) %>%
+  slice_tail(n=5) %>%
+  group_by(year) %>%
+  filter(min(year)>(cur.year - 15)) %>%
+  group_by(indicator_code, iso3c) %>%
+  mutate(VALUE = mean(VALUE)) %>%
+  slice(1) %>%
+  select(-year) %>%
+  select(indicator_code, iso3c, VALUE) %>%
+  ungroup()
+
+bench.reg <- bench.tidy3 %>% pivot_wider(names_from="indicator_code", values_from="VALUE")
+bench.reg2 <- bench.tidy3 %>% pivot_wider(names_from="indicator_code", values_from="VALUE") %>% select(-iso3c)
+length.db <- nrow(bench.reg)
+
+bench.reg$pos.vals <- rownames(bench.reg)
+bench.reg <- bench.reg %>% select(pos.vals, everything())
+merge.vals <- bench.reg %>% select(pos.vals, iso3c)
+
+col10 <- names(bench.reg2)
+col10 <- col10[!col10 %in% "NY.GDP.PCAP.PP.KD"]
+
+lm.bivar <- vector("list", length(col10))
+log.bivar <- vector("list", length(col10))
+poly2.bivar <- vector("list", length(col10))
+poly3.bivar <- vector("list", length(col10))
+
+fit.list <- data.frame()
+
+# Polynomial regressions cannot have NAs, replace df NA with 0
+bench.reg3 <- bench.reg2 %>% replace(is.na(.), 0)
+
+# Remove 0 vals for log regression
+bench.reg4 <- bench.reg2 + 1
+
+for (i in seq_along(col10)) {
+  
+  val <- bench.reg2 %>% select(col10[i])
+  
+  if (length(which(!is.na(val))) <= 1){
+    lm.bivar[[i]] <- NULL
+  } else {
+    lm.bivar[[i]] <- lm(reformulate(col10[i], "NY.GDP.PCAP.PP.KD"), data = bench.reg2)
+  }
+  
+  r2.lm <- as.numeric(summary(lm.bivar[[i]])$r.squared)
+  lin.res <- c(r2.lm, "linear")
+  
+  if (length(which(!is.na(val))) <= 1){
+    log.bivar[[i]] <- NULL
+  } else {
+    log.bivar[[i]] <- lm(formula(paste(col10[i], 
+                                       paste(" ~ log(", "NY.GDP.PCAP.PP.KD", ")",
+                                             collapse="+"))), na.action=na.exclude, data = bench.reg4)
+  }
+  
+  r2.log <- as.numeric(summary(log.bivar[[i]])$r.squared)
+  log.res <- c(r2.log, "log")
+  
+  if (length(which(!is.na(val))) <= 2){
+    poly2.bivar[[i]] <- NULL
+  } else {
+    poly2.bivar[[i]] <- lm(formula(paste(col10[i], paste(" ~ poly(", "NY.GDP.PCAP.PP.KD", ", 2)", collapse="+"))), data = bench.reg3)
+    r2.poly2 <- as.numeric(summary(poly2.bivar[[i]])$r.squared)
+    
+    poly2.res <- c(r2.poly2, "poly2")
+  }
+  
+  
+  if (length(which(!is.na(val))) <= 3){
+    poly3.bivar[[i]] <- NULL
+  } else {
+    poly3.bivar[[i]] <- lm(formula(paste(col10[i], paste(" ~ poly(", "NY.GDP.PCAP.PP.KD", ", 3)", collapse="+"))), data = bench.reg3)
+    r2.poly3 <- as.numeric(summary(poly3.bivar[[i]])$r.squared)
+    poly3.res <- c(r2.poly3, "poly3")
+    
+  }
+  
+  res <- as.data.frame(rbind(lin.res, log.res, poly2.res, poly3.res))
+  
+  indic.name <- col10[i]
+  
+  res <- res %>% 
+    mutate(V1 = as.numeric(V1)) %>%
+    filter(V1 == max(V1)) %>% 
+    cbind(indic.name) %>%
+    rename("r2" = "V1", "fit" = "V2", "code" = "indic.name") %>%
+    select(code, r2, fit)
+  
+  fit.list <- rbind(fit.list, res)
+}
+
+log.list <- fit.list %>% filter(fit == "log") %>% arrange(-r2) %>% .[[1]]
+poly.list <- fit.list %>% filter(fit == "poly3") %>% arrange(-r2) %>% .[[1]]
+lin.list <- fit.list %>% filter(fit == "linear") %>% arrange(-r2) %>% .[[1]]
+
+avail.list <- bench.tidy2 %>% ungroup() %>% distinct(indicator_code, indicator)
+
+lin.list2 <- avail.list %>% filter(indicator_code %in% lin.list)
+lin.list <- lin.list2$indicator[order(match(lin.list2$indicator_code,lin.list))]
+
+log.list2 <- avail.list %>% filter(indicator_code %in% log.list)
+log.list <- log.list2$indicator[order(match(log.list2$indicator_code,log.list))]
+
+poly.list2 <- avail.list %>% filter(indicator_code %in% poly.list)
+poly.list <- poly.list2$indicator[order(match(poly.list2$indicator_code,poly.list))]
+
+lin.list <- sort(lin.list)
+log.list <- sort(log.list)
+poly.list <- sort(poly.list)
+
+var.list <- unique(bench.tidy2$indicator)
+y <- "`GDP per capita, PPP (constant 2011 international $)`"
+
+for(var in lin.list) {
+  
+  var1 <- paste0("`", var, "`")
+  
+  bench.tidy2$`income group` <- factor(bench.tidy2$`income group`, 
+                                       levels=c("High income", "Upper middle income",
+                                                "Lower middle income", "Low income"))
+
+   p <- bench.tidy2 %>%
+    filter(!iso3c %in% c("ZAF", "CYP")) %>%
+    ungroup() %>%
+    filter(indicator %in% c("GDP per capita, PPP (constant 2011 international $)", var)) %>%
+    filter(!VALUE == 0) %>%
+    select(indicator, `income group`, iso3c, year, VALUE) %>%
+    rename("income.group" = "income group") %>%
+    mutate(income.group = as.character(income.group), year=as.numeric(year)) %>%
+    pivot_wider(names_from = "indicator", values_from = "VALUE") %>%
+    drop_na() %>%
+    group_by(iso3c) %>%
+    filter(year == max(year)) %>%
+    ungroup() %>%
+    mutate(n = length(iso3c)) %>%
+    ggplot(aes_string(x = y, y = var1)) +
+    geom_point(aes(color=1)) +
+    scale_color_viridis_c() +
+    stat_poly_eq(formula = y ~ x, 
+                aes(label = paste(..rr.label.., sep = "~~~")), 
+                parse = TRUE) + 
+    # geom_label(aes(label = iso3c), size = 2) +
+    geom_smooth(method = "lm", se = F,
+                formula = y ~ x) +
+    guides(color = F) +
+    ylim(-5, NA) 
+
+  print(p)
+  
+}
+```
+
+#### Log fit 
+
+```{r log scatterplot, message=F, out.width="33%", fig.show="hold"}
+for(var in log.list) {
+  
+  var1 <- paste0("`", var, "`")
+  
+  bench.tidy2$`income group` <- factor(bench.tidy2$`income group`, 
+                                       levels=c("High income", "Upper middle income",
+                                                "Lower middle income", "Low income"))
+  
+  bench.tidy2 <- bench.tidy2 %>% filter(!iso3c == "CYP")
+  
+  p <- bench.tidy2 %>%
+    ungroup() %>%
+    filter(indicator %in% c("GDP per capita, PPP (constant 2011 international $)", var)) %>%
+    filter(!indicator == "Agricultural land (% of land area)" | !iso3c == "CHN") %>%
+    filter(!VALUE == 0) %>%
+    select(indicator, `income group`, iso3c, year, VALUE) %>%
+    rename("income.group" = "income group") %>%
+    distinct() %>%
+    pivot_wider(names_from = "indicator", values_from = "VALUE") %>%
+    drop_na() %>%
+    group_by(iso3c) %>%
+    filter(year == max(year)) %>%
+    ungroup() %>%
+    mutate(n = length(iso3c)) %>%
+    ggplot(aes_string(x = y, y = var1)) +
+    geom_point(aes(color=1)) +
+    scale_color_viridis_c() +
+    stat_poly_eq(formula = y ~ log(x), 
+                aes(label = paste(..rr.label.., sep = "~~~")), 
+                parse = TRUE) + 
+    # geom_label(aes(label = iso3c), size = 2) +
+    geom_smooth(method = "lm", se = F,
+                formula = y ~ log(x)) +
+    guides(color = F) +
+    ylim(-5, NA) 
+
+  print(p)
+  
+}
+```
+
+#### Polynomial(3) fit 
+
+```{r poly fit, message=F, out.width="33%", fig.show="hold"}
+
+for(var in poly.list) {
+  
+  var1 <- paste0("`", var, "`")
+  
+  bench.tidy2$`income group` <- factor(bench.tidy2$`income group`, 
+                                       levels=c("High income", "Upper middle income",
+                                                "Lower middle income", "Low income"))
+  
+  # bench.tidy2 %>%
+  #   filter(indicator %in% c("GDP per capita, PPP (constant 2011 international $)", var)) %>%
+  #   dplyr::group_by(`income group`, iso3c, year, indicator) %>%
+  #   dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  #   dplyr::filter(n > 1L) 
+
+  p <- bench.tidy2 %>%
+    ungroup() %>%
+    filter(indicator %in% c("GDP per capita, PPP (constant 2011 international $)", var)) %>%
+    filter(!VALUE == 0) %>%
+    filter(!indicator %in% c("Arable land (% of land area)", "Forest area (% of land area)") | !iso3c == "CHN") %>%
+    select(indicator, `income group`, iso3c, year, VALUE) %>%
+    rename("income.group" = "income group") %>%
+    pivot_wider(names_from = "indicator", values_from = "VALUE") %>%
+    drop_na() %>%
+    group_by(iso3c) %>%
+    filter(year == max(year)) %>%
+    ungroup() %>%
+    mutate(n = length(iso3c)) %>%
+    ggplot(aes_string(x = y, y = var1)) +
+    geom_point(aes(color=1)) +
+    scale_color_viridis_c() +
+    stat_poly_eq(formula = y ~ poly(x, 3), 
+                aes(label = paste(..rr.label.., sep = "~~~")), 
+                parse = TRUE) + 
+    # geom_label(aes(label = iso3c), size = 2) +
+    geom_smooth(method = "lm", se = F,
+                formula = y ~ poly(x, 3)) +
+    guides(color = F) +
+    ylim(-5, NA) 
+
+  print(p)
+  
+}
+
+
+```
+
